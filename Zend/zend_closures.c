@@ -226,6 +226,11 @@ ZEND_METHOD(Closure, call)
 			memset(ptr, 0, my_function->op_array.cache_size);
 		}
 
+		/* Closure::call() also copies the header and changes lexical scope.
+		 * Never reuse native property checks compiled for the original scope. */
+		if (ZEND_USER_CODE(my_function->type) && zend_generics_jit_clone_hook != NULL) {
+			zend_generics_jit_clone_hook(&my_function->op_array);
+		}
 		zend_call_function(&fci, &fci_cache);
 
 		if (ZEND_USER_CODE(my_function->type)) {

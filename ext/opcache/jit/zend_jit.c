@@ -3145,6 +3145,7 @@ void ZEND_FASTCALL zend_jit_compile_generic_func(zend_execute_data *execute_data
 	if (!ext->attempted) {
 		SHM_UNPROTECT();
 		zend_jit_unprotect();
+		/* A failed attempt stays on VM fallback rather than retrying each call. */
 		ext->attempted = true;
 		zend_try {
 			/* Analyze the concrete signature, never the unbound template. */
@@ -3161,6 +3162,50 @@ void ZEND_FASTCALL zend_jit_compile_generic_func(zend_execute_data *execute_data
 	}
 }
 
+/* The cache retains function metadata/body references, never captured values,
+ * bound objects or closure-local static-variable tables. */
+static void zend_jit_generic_closure_cache_dtor(zval *zv)
+{
+	destroy_op_array(Z_PTR_P(zv));
+}
+
+static zend_string *zend_jit_generic_closure_key(const zend_op_array *op_array,
+		const zend_jit_op_array_generic_extension *source)
+{
+	struct {
+		const void *body;
+		const void *scope;
+		const void *binding;
+		uint32_t flags;
+		uint32_t num_args;
+		uint32_t required_num_args;
+	} identity;
+	memset(&identity, 0, sizeof(identity));
+	identity.body = source->orig_handlers;
+	identity.scope = op_array->scope;
+	identity.binding = op_array->generic_binding;
+	identity.flags = op_array->fn_flags & ~(ZEND_ACC_IMMUTABLE|ZEND_ACC_HEAP_RT_CACHE);
+	identity.num_args = op_array->num_args;
+	identity.required_num_args = op_array->required_num_args;
+	smart_str key = {0};
+	smart_str_appendl(&key, (char *) &identity, sizeof(identity));
+	if (op_array->arg_info) {
+		uint32_t has_ret = (op_array->fn_flags & ZEND_ACC_HAS_RETURN_TYPE) != 0;
+		uint32_t count = op_array->num_args + has_ret
+			+ ((op_array->fn_flags & ZEND_ACC_VARIADIC) != 0);
+		const zend_arg_info *args = op_array->arg_info - has_ret;
+		for (uint32_t i = 0; i < count; i++) {
+			zend_string *type = zend_type_to_string(args[i].type);
+			size_t len = ZSTR_LEN(type);
+			smart_str_appendl(&key, (char *) &len, sizeof(len));
+			smart_str_append(&key, type);
+			zend_string_release(type);
+		}
+	}
+	smart_str_0(&key);
+	return key.s;
+}
+
 static void zend_jit_generic_function_clone_extension(zend_op_array *op_array)
 {
 	zend_jit_op_array_generic_extension *source =
@@ -3168,6 +3213,23 @@ static void zend_jit_generic_function_clone_extension(zend_op_array *op_array)
 	if (!source || !(source->base.func_info.flags & ZEND_FUNC_GENERIC_FUNCTION)) {
 		return;
 	}
+	zend_string *cache_key = NULL;
+	if ((op_array->fn_flags & ZEND_ACC_CLOSURE)
+	 && !(CG(compiler_options) & ZEND_COMPILE_PRELOAD)) {
+		if (!JIT_G(generic_closure_cache)) {
+			ALLOC_HASHTABLE(JIT_G(generic_closure_cache));
+			zend_hash_init(JIT_G(generic_closure_cache), 8, NULL,
+				zend_jit_generic_closure_cache_dtor, false);
+		}
+		cache_key = zend_jit_generic_closure_key(op_array, source);
+		zend_op_array *prototype = zend_hash_find_ptr(JIT_G(generic_closure_cache), cache_key);
+		if (prototype) {
+			ZEND_SET_FUNC_INFO(op_array, ZEND_FUNC_INFO(prototype));
+			zend_string_release(cache_key);
+			return;
+		}
+	}
+
 	size_t size = sizeof(*source) + (op_array->last - 1) * sizeof(void *);
 	zend_jit_op_array_generic_extension *ext;
 	/* Persisted copies must never retain request-arena entry tables. */
@@ -3186,6 +3248,22 @@ static void zend_jit_generic_function_clone_extension(zend_op_array *op_array)
 	ext->base.op_array = op_array;
 	ext->orig_handlers = source->orig_handlers;
 	memcpy(ext->handlers, ext->orig_handlers, op_array->last * sizeof(void *));
+	if (cache_key) {
+		/* Native code may embed signature/prototype addresses. Give the
+		 * shared entry table a header that outlives every closure copy. */
+		zend_op_array *prototype = zend_arena_alloc(&CG(arena), sizeof(zend_op_array));
+		memcpy(prototype, op_array, sizeof(zend_op_array));
+		function_add_ref((zend_function *) prototype);
+		prototype->fn_flags &= ~ZEND_ACC_HEAP_RT_CACHE;
+		if (prototype->fn_flags2 & ZEND_ACC2_GENERIC_SUBST_ARG_INFO) {
+			zend_generics_dup_substituted_arg_info(prototype);
+		}
+		ZEND_SET_FUNC_INFO(prototype, (void *) ext);
+		ext->base.op_array = prototype;
+		zend_hash_add_new_ptr(JIT_G(generic_closure_cache), cache_key, prototype);
+		zend_string_release(cache_key);
+	}
+
 	ZEND_SET_FUNC_INFO(op_array, (void *) ext);
 }
 
@@ -4148,6 +4226,12 @@ void zend_jit_deactivate(void)
 		zend_jit_protect();
 		SHM_PROTECT();
 		zend_shared_alloc_unlock();
+	}
+
+	if (JIT_G(generic_closure_cache)) {
+		zend_hash_destroy(JIT_G(generic_closure_cache));
+		FREE_HASHTABLE(JIT_G(generic_closure_cache));
+		JIT_G(generic_closure_cache) = NULL;
 	}
 
 	zend_jit_profile_counter = 0;

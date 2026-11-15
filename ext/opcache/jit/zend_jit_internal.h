@@ -137,7 +137,9 @@ typedef struct _zend_jit_op_array_extension {
 typedef struct _zend_jit_op_array_generic_extension {
 	zend_jit_op_array_extension base;
 	bool attempted;
+	/* Borrowed immutable VM handlers in the shared root allocation. */
 	const zend_vm_opcode_handler_t *orig_handlers;
+	/* Mutable native entry points, owned by this specialization. */
 	zend_vm_opcode_handler_t handlers[1];
 } zend_jit_op_array_generic_extension;
 

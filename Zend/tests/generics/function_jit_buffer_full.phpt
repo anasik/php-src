@@ -26,13 +26,19 @@ class BufferJitFactory<T> {
         };
     }
 }
-$factory = new BufferJitFactory<int>();
 $start = opcache_get_status(false)['jit']['buffer_free'];
 $previous = $start;
 $fallback = false;
 for ($i = 0; $i < 1000; $i++) {
+    // Distinct bindings must still compile independently and eventually fill
+    // a small buffer; recreating one binding now reuses its compilation.
+    eval("class BufferJitType$i {}");
+    $type = "BufferJitType$i";
+    $factoryType = "BufferJitFactory<$type>";
+    $factory = new $factoryType();
+    $value = new $type();
     $closure = $factory->mapper();
-    if ($closure($i, 10) !== $i) { throw new Exception('Wrong value'); }
+    if ($closure($value, 10) !== $value) { throw new Exception('Wrong value'); }
     $free = opcache_get_status(false)['jit']['buffer_free'];
     if ($free === $previous) { $fallback = true; }
     $previous = $free;

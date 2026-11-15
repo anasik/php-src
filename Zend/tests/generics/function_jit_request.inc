@@ -25,3 +25,13 @@ try {
 } catch (TypeError $e) {
 }
 echo "request-local ok\n";
+$beforeCopies = opcache_get_status(false)['jit']['buffer_free'];
+$factory = new RequestJitFactory<int>();
+for ($i = 0; $i < 100; $i++) {
+    if (($factory->mapper())($i) !== $i) {
+        throw new Exception('Wrong cached closure result');
+    }
+}
+if (opcache_get_status(false)['jit']['buffer_free'] !== $beforeCopies) {
+    throw new Exception('Repeated closure compilation within request');
+}

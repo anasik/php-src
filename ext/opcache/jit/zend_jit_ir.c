@@ -2541,10 +2541,12 @@ static int zend_jit_hybrid_generic_func_dispatch_stub(zend_jit_ctx *jit)
 	func = ir_LOAD_A(jit_EX(func));
 	ext = ir_LOAD_A(ir_ADD_OFFSET(func, offsetof(zend_op_array, reserved[zend_func_info_rid])));
 	ir_ref opcodes = ir_LOAD_A(ir_ADD_OFFSET(func, offsetof(zend_op_array, opcodes)));
-	ZEND_ASSERT(sizeof(zend_op) == 32 && sizeof(void *) == 8);
-	ir_ref index = ir_SHR_A(ir_SUB_A(jit_IP(jit), opcodes), ir_CONST_ADDR(2));
+	/* Convert the bytecode byte offset to a handler-table byte offset.
+	 * zend_op/pointer sizes differ on x86-32 and inference-debug builds. */
+	ir_ref slot_offset = ir_DIV_A(ir_SUB_A(jit_IP(jit), opcodes),
+		ir_CONST_ADDR(sizeof(zend_op) / sizeof(zend_vm_opcode_handler_t)));
 	ir_ref handlers = ir_ADD_OFFSET(ext, offsetof(zend_jit_op_array_generic_extension, handlers));
-	ir_IJMP(ir_LOAD_A(ir_ADD_A(handlers, index)));
+	ir_IJMP(ir_LOAD_A(ir_ADD_A(handlers, slot_offset)));
 	return 1;
 }
 
