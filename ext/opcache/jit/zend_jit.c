@@ -3363,21 +3363,6 @@ int zend_jit_op_array(zend_op_array *op_array, zend_script *script)
 		return SUCCESS;
 	}
 
-	if (UNEXPECTED((op_array->generic_params != NULL)
-		|| (op_array->scope
-			&& (op_array->scope->ce_flags2
-				& (ZEND_ACC2_GENERIC_TEMPLATE|ZEND_ACC2_GENERIC_INSTANCE))))
-	 && (CG(compiler_options) & ZEND_COMPILE_PRELOAD)
-	 && JIT_G(trigger) == ZEND_JIT_ON_HOT_TRACE) {
-		/* Preloaded generic families stay interpreted for now: the preload
-		 * optimize/persist/fix-up pipeline re-syncs instance method headers
-		 * from the template AFTER extensions would be attached, leaving
-		 * stale identity behind the shared dispatch handlers. Runtime
-		 * stamping (the common case) gets per-clone tracing. */
-		ZEND_SET_FUNC_INFO(op_array, NULL);
-		return SUCCESS;
-	}
-
 	if (UNEXPECTED(op_array->fn_flags2 & ZEND_ACC2_GENERIC_CONTEXT)
 	 && JIT_G(trigger) == ZEND_JIT_ON_HOT_TRACE) {
 		/* Closures declared in generic templates: per-creation copies carry
