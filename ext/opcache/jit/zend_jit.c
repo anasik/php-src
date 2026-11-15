@@ -100,6 +100,17 @@ static zend_vm_opcode_handler_t zend_jit_loop_trace_counter_handler = NULL;
  * EXECUTING clone's extension for a compiled trace before counting. */
 static zend_vm_opcode_handler_t zend_jit_generic_func_trace_dispatch_handler = NULL;
 static zend_vm_opcode_handler_t zend_jit_generic_loop_trace_dispatch_handler = NULL;
+static zend_vm_opcode_handler_t zend_jit_generic_func_dispatch_handler = NULL;
+
+static zend_always_inline bool zend_jit_op_array_has_generic_types(const zend_op_array *op_array)
+{
+	return (ZEND_FUNC_INFO(op_array)
+			&& (ZEND_FUNC_INFO(op_array)->flags & ZEND_FUNC_GENERIC_FUNCTION))
+		|| op_array->generic_params
+		|| (op_array->fn_flags2 & ZEND_ACC2_GENERIC_CONTEXT)
+		|| (op_array->scope && (op_array->scope->ce_flags2
+			& (ZEND_ACC2_GENERIC_TEMPLATE|ZEND_ACC2_GENERIC_INSTANCE)));
+}
 
 #if ZEND_VM_KIND == ZEND_VM_KIND_CALL || ZEND_VM_KIND == ZEND_VM_KIND_TAILCALL
 static ZEND_OPCODE_HANDLER_RET ZEND_OPCODE_HANDLER_CCONV zend_runtime_jit(ZEND_OPCODE_HANDLER_ARGS);
@@ -580,6 +591,11 @@ static zend_class_entry* zend_get_known_class(const zend_op_array *op_array, con
 
 		ZEND_ASSERT(Z_TYPE_P(zv) == IS_STRING);
 		class_name = Z_STR_P(zv);
+		/* Even NO_AUTOLOAD can stamp a generic class. Analysis must not
+		 * create request-owned classes inside its temporary arena checkpoint. */
+		if (memchr(ZSTR_VAL(class_name), '<', ZSTR_LEN(class_name))) {
+			return NULL;
+		}
 		ce = zend_lookup_class_ex(class_name, NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
 		if (ce && (ce->type == ZEND_INTERNAL_CLASS || ce->info.user.filename != op_array->filename)) {
 			ce = NULL;
@@ -1445,7 +1461,8 @@ static int zend_jit(const zend_op_array *op_array, zend_ssa *ssa, const zend_op 
 	bool ce_is_instanceof;
 	bool on_this;
 
-	ZEND_ASSERT(!(op_array->fn_flags & ZEND_ACC_CLOSURE) || !(op_array->scope));
+	ZEND_ASSERT(!(op_array->fn_flags & ZEND_ACC_CLOSURE) || !op_array->scope
+		|| zend_jit_op_array_has_generic_types(op_array));
 
 	if (JIT_G(bisect_limit)) {
 		jit_bisect_pos++;
@@ -3026,6 +3043,7 @@ static void zend_jit_cleanup_func_info(zend_op_array *op_array)
 		    JIT_G(trigger) == ZEND_JIT_ON_HOT_COUNTERS) {
 			func_info->num = 0;
 			func_info->flags &= ZEND_FUNC_JIT_ON_FIRST_EXEC
+				| ZEND_FUNC_GENERIC_FUNCTION
 				| ZEND_FUNC_JIT_ON_PROF_REQUEST
 				| ZEND_FUNC_JIT_ON_HOT_COUNTERS
 				| ZEND_FUNC_JIT_ON_HOT_TRACE;
@@ -3114,6 +3132,94 @@ jit_failure:
 	zend_arena_release(&CG(arena), checkpoint);
 	JIT_G(trigger) = orig_trigger;
 	return FAILURE;
+}
+
+void ZEND_FASTCALL zend_jit_compile_generic_func(zend_execute_data *execute_data)
+{
+	zend_op_array *op_array = &EX(func)->op_array;
+	zend_jit_op_array_generic_extension *ext =
+		(zend_jit_op_array_generic_extension *) ZEND_FUNC_INFO(op_array);
+	bool do_bailout = false;
+
+	zend_shared_alloc_lock();
+	if (!ext->attempted) {
+		SHM_UNPROTECT();
+		zend_jit_unprotect();
+		ext->attempted = true;
+		zend_try {
+			/* Analyze the concrete signature, never the unbound template. */
+			zend_real_jit_func(op_array, NULL, NULL, ZEND_JIT_ON_FIRST_EXEC);
+		} zend_catch {
+			do_bailout = true;
+		} zend_end_try();
+		zend_jit_protect();
+		SHM_PROTECT();
+	}
+	zend_shared_alloc_unlock();
+	if (do_bailout) {
+		zend_bailout();
+	}
+}
+
+static void zend_jit_generic_function_clone_extension(zend_op_array *op_array)
+{
+	zend_jit_op_array_generic_extension *source =
+		(zend_jit_op_array_generic_extension *) ZEND_FUNC_INFO(op_array);
+	if (!source || !(source->base.func_info.flags & ZEND_FUNC_GENERIC_FUNCTION)) {
+		return;
+	}
+	size_t size = sizeof(*source) + (op_array->last - 1) * sizeof(void *);
+	zend_jit_op_array_generic_extension *ext;
+	/* Persisted copies must never retain request-arena entry tables. */
+	if ((CG(compiler_options) & ZEND_COMPILE_PRELOAD)
+	 || (op_array->fn_flags & ZEND_ACC_IMMUTABLE)) {
+		ext = zend_shared_alloc(size);
+		if (!ext) {
+			zend_accel_error_noreturn(ACCEL_LOG_FATAL,
+				"Not enough shared memory for generic function JIT metadata");
+		}
+	} else {
+		ext = zend_arena_alloc(&CG(arena), size);
+	}
+	memset(ext, 0, sizeof(*ext));
+	ext->base.func_info.flags = ZEND_FUNC_JIT_ON_FIRST_EXEC|ZEND_FUNC_GENERIC_FUNCTION;
+	ext->base.op_array = op_array;
+	ext->orig_handlers = source->orig_handlers;
+	memcpy(ext->handlers, ext->orig_handlers, op_array->last * sizeof(void *));
+	ZEND_SET_FUNC_INFO(op_array, (void *) ext);
+}
+
+static int zend_jit_setup_generic_function(zend_op_array *op_array)
+{
+	if (!op_array->last || (op_array->fn_flags & ZEND_ACC_ABSTRACT)) {
+		ZEND_SET_FUNC_INFO(op_array, NULL);
+		return SUCCESS;
+	}
+	zend_jit_op_array_generic_extension *ext =
+		zend_shared_alloc_get_xlat_entry(op_array->opcodes);
+	if (ext && (ext->base.func_info.flags & ZEND_FUNC_GENERIC_FUNCTION)) {
+		ZEND_SET_FUNC_INFO(op_array, (void *) ext);
+		zend_jit_generic_function_clone_extension(op_array);
+		return SUCCESS;
+	}
+	size_t size = sizeof(*ext) + (2 * op_array->last - 1) * sizeof(void *);
+	ext = zend_shared_alloc(size);
+	if (!ext) {
+		return FAILURE;
+	}
+	memset(ext, 0, sizeof(*ext));
+	ext->base.func_info.flags = ZEND_FUNC_JIT_ON_FIRST_EXEC|ZEND_FUNC_GENERIC_FUNCTION;
+	ext->base.op_array = op_array;
+	ext->orig_handlers = ext->handlers + op_array->last;
+	for (uint32_t i = 0; i < op_array->last; i++) {
+		ext->handlers[i] = op_array->opcodes[i].handler;
+		((zend_vm_opcode_handler_t *) ext->orig_handlers)[i] = ext->handlers[i];
+	}
+	ZEND_SET_FUNC_INFO(op_array, (void *) ext);
+	/* Concrete specializations are compiled on first execution. */
+	op_array->opcodes[0].handler = zend_jit_generic_func_dispatch_handler;
+	zend_shared_alloc_register_xlat_entry(op_array->opcodes, ext);
+	return SUCCESS;
 }
 
 /* GCC cannot tail-call from a function that uses setjmp. */
@@ -3346,21 +3452,11 @@ int zend_jit_op_array(zend_op_array *op_array, zend_script *script)
 		return FAILURE;
 	}
 
-	if (UNEXPECTED((op_array->generic_params != NULL)
-		|| (op_array->scope
-			&& (op_array->scope->ce_flags2
-				& (ZEND_ACC2_GENERIC_TEMPLATE|ZEND_ACC2_GENERIC_INSTANCE)))
-		|| (op_array->fn_flags2 & ZEND_ACC2_GENERIC_CONTEXT))
+	if (UNEXPECTED(zend_jit_op_array_has_generic_types(op_array))
 	 && JIT_G(trigger) != ZEND_JIT_ON_HOT_TRACE) {
-		/* Function-mode JIT compiles ONE machine body from ONE signature and
-		 * installs it into the opcodes SHARED by every stamped instantiation
-		 * clone -- class-level clones, generic-METHOD clones and per-creation
-		 * closure copies alike -- bypassing the clones' substituted arg_info
-		 * (a check compiled from the template rejects everything: "must be
-		 * of type T"). Keep these bodies interpreted; hot-trace mode
-		 * compiles per trace and dispatches per clone. */
-		ZEND_SET_FUNC_INFO(op_array, NULL);
-		return SUCCESS;
+		/* Shared bytecode dispatches through the executing specialization's
+		 * entry table. Analyze its concrete signature on first execution. */
+		return zend_jit_setup_generic_function(op_array);
 	}
 
 	if (UNEXPECTED(op_array->fn_flags2 & ZEND_ACC2_GENERIC_CONTEXT)
@@ -3454,6 +3550,9 @@ static void zend_jit_link_func_info(zend_op_array *op_array)
 
 		if (jit_extension) {
 			ZEND_SET_FUNC_INFO(op_array, jit_extension);
+			if (zend_generics_jit_clone_hook != NULL) {
+				zend_generics_jit_clone_hook(op_array);
+			}
 		}
 	}
 }
@@ -3488,14 +3587,8 @@ int zend_jit_script(zend_script *script)
 	} else if (JIT_G(trigger) == ZEND_JIT_ON_SCRIPT_LOAD) {
 		for (i = 0; i < call_graph.op_arrays_count; i++) {
 			const zend_op_array *op_array = call_graph.op_arrays[i];
-			if ((op_array->generic_params != NULL)
-			 || (op_array->scope
-				&& (op_array->scope->ce_flags2
-					& (ZEND_ACC2_GENERIC_TEMPLATE|ZEND_ACC2_GENERIC_INSTANCE)))
-			 || (op_array->fn_flags2 & ZEND_ACC2_GENERIC_CONTEXT)) {
-				/* Same exclusion as zend_jit_op_array: one machine body from
-				 * the template's signature would serve every clone through
-				 * the shared opcodes, bypassing substituted arg_info. */
+			if (zend_jit_op_array_has_generic_types(op_array)) {
+				/* Defer templates until a concrete specialization executes. */
 				ZEND_SET_FUNC_INFO((zend_op_array *) op_array, NULL);
 			}
 		}
@@ -3545,13 +3638,20 @@ int zend_jit_script(zend_script *script)
 		for (i = 0; i < call_graph.op_arrays_count; i++) {
 			ZEND_SET_FUNC_INFO(call_graph.op_arrays[i], NULL);
 		}
+		for (i = 0; i < call_graph.op_arrays_count; i++) {
+			if (zend_jit_op_array_has_generic_types(call_graph.op_arrays[i])
+			 && zend_jit_setup_generic_function(call_graph.op_arrays[i]) != SUCCESS) {
+				goto jit_failure;
+			}
+		}
 	} else {
 		ZEND_UNREACHABLE();
 	}
 
 	zend_arena_release(&CG(arena), checkpoint);
 
-	if (JIT_G(trigger) == ZEND_JIT_ON_FIRST_EXEC
+	if (JIT_G(trigger) == ZEND_JIT_ON_SCRIPT_LOAD
+	 || JIT_G(trigger) == ZEND_JIT_ON_FIRST_EXEC
 	 || JIT_G(trigger) == ZEND_JIT_ON_PROF_REQUEST
 	 || JIT_G(trigger) == ZEND_JIT_ON_HOT_COUNTERS
 	 || JIT_G(trigger) == ZEND_JIT_ON_HOT_TRACE) {
@@ -3665,6 +3765,7 @@ static void zend_jit_init_handlers(void)
 		zend_jit_loop_trace_counter_handler = (zend_vm_opcode_handler_t)zend_jit_stub_handlers[jit_stub_hybrid_loop_trace_counter];
 		zend_jit_generic_func_trace_dispatch_handler = (zend_vm_opcode_handler_t)zend_jit_stub_handlers[jit_stub_hybrid_generic_func_trace_dispatch];
 		zend_jit_generic_loop_trace_dispatch_handler = (zend_vm_opcode_handler_t)zend_jit_stub_handlers[jit_stub_hybrid_generic_loop_trace_dispatch];
+		zend_jit_generic_func_dispatch_handler = (zend_vm_opcode_handler_t)zend_jit_stub_handlers[jit_stub_hybrid_generic_func_dispatch];
 #else
 		zend_jit_runtime_jit_handler = zend_runtime_jit;
 		zend_jit_profile_jit_handler = zend_jit_profile_helper;
@@ -3675,6 +3776,7 @@ static void zend_jit_init_handlers(void)
 		zend_jit_loop_trace_counter_handler = zend_jit_loop_trace_helper;
 		zend_jit_generic_func_trace_dispatch_handler = zend_jit_generic_func_trace_dispatch_helper;
 		zend_jit_generic_loop_trace_dispatch_handler = zend_jit_generic_loop_trace_dispatch_helper;
+		zend_jit_generic_func_dispatch_handler = zend_jit_generic_func_dispatch_helper;
 #endif
 }
 
@@ -3958,6 +4060,8 @@ void zend_jit_startup(void *buf, size_t size, bool reattached)
 		 * type sources, compiled-code slots); the stamper calls back here
 		 * for every clone it creates. */
 		zend_generics_jit_clone_hook = zend_jit_trace_clone_extension;
+	} else {
+		zend_generics_jit_clone_hook = zend_jit_generic_function_clone_extension;
 	}
 
 	zend_jit_unprotect();

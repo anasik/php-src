@@ -1488,7 +1488,8 @@ static void zend_accel_persist_link_func_info(zend_op_array *op_array, const zen
 		if ((op_array->scope != ce
 		 || (ce->ce_flags2 & ZEND_ACC2_GENERIC_INSTANCE)
 		 || (op_array->fn_flags & ZEND_ACC_TRAIT_CLONE))
-		  && (JIT_G(trigger) == ZEND_JIT_ON_FIRST_EXEC
+		  && (JIT_G(trigger) == ZEND_JIT_ON_SCRIPT_LOAD
+		  || JIT_G(trigger) == ZEND_JIT_ON_FIRST_EXEC
 		  || JIT_G(trigger) == ZEND_JIT_ON_PROF_REQUEST
 		  || JIT_G(trigger) == ZEND_JIT_ON_HOT_COUNTERS
 		  || JIT_G(trigger) == ZEND_JIT_ON_HOT_TRACE)) {
